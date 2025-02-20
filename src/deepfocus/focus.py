@@ -90,7 +90,15 @@ def is_very_rare_token(token, fasttext_model):
     """
     return token not in fasttext_model or np.absolute(fasttext_model[token]).sum() == 0
 
-
+def average_token_embeddings(tokenizer, embeddings, token):
+    tokens = tokenizer.encode(token, add_special_tokens=False)
+    
+    assert len(tokens) > 0, f"No source tokens found for target token {target_token}. Something seems off!"
+    
+    token_embeddings = embeddings[tokens]
+    
+    return token_embeddings.mean(dim=0)
+    
 @torch.no_grad()
 def FOCUS(
     target_tokenizer: PreTrainedTokenizer,
@@ -113,6 +121,8 @@ def FOCUS(
     seed: int = 42,
     device="cpu",
     verbosity: Literal["debug", "info", "silent"] = "info",
+    ood_init_method: Literal["random", "average"] = "random",
+    special_tokens_source_to_target_mapping: dict[str, str] | None = None
 ):
     """FOCUS method for transferring pretrained token embeddings to a different language from Dobler and de Melo (2023).
 
@@ -135,7 +145,8 @@ def FOCUS(
         seed (int, optional): Defaults to 42.
         device (str | torch.device, optional): Defaults to "cpu".
         verbosity ("debug", "info", "silent", optional): Defaults to "info".
-
+        ood_init_method ("random" or "average", optional): Method to initialize out-of-distribution tokens. Defaults to "random".
+        special_tokens_source_to_target_mapping (dict[str, str] | None, optional): Mapping from special tokens in the source tokenizer to the target tokenizer. Defaults to None.
     Returns:
         Tensor: A tensor of shape `(len(target_tokenizer), embedding_dim)` with the initialized embeddings.
     """
@@ -192,19 +203,31 @@ def FOCUS(
     # Clean overlapping tokens
     extend_tokenizer_vocab = extend_tokenizer.get_vocab() if extend_tokenizer else None
     very_rare_overlapping_tokens = []
-
+    
     for token, overlapping_token_info in tqdm(
         sorted_overlapping_tokens,
         desc="Populating auxiliary embeddings for overlapping token...",
         leave=False,
     ):
         embs_lst = [source_embeddings[s.id] for s in overlapping_token_info.source]
-        overlapping_tokens[token].source_embedding = embs_lst[0]
-
+        
+        # Check if there's a native form match when multiple embeddings exist
         if len(embs_lst) > 1:
-            logger.warning(
-                f"{token} has multiple source embeddings (using first): {[s.native_form for s in overlapping_token_info.source][:min(5, len(embs_lst))]}"
-            )
+            native_form_match = None
+            for idx, source_token in enumerate(overlapping_token_info.source):
+                if source_token.native_form == overlapping_token_info.target.native_form:
+                    native_form_match = idx
+                    break
+            
+            selected_idx = native_form_match if native_form_match is not None else 0
+            overlapping_tokens[token].source_embedding = embs_lst[selected_idx]
+            
+            if native_form_match is None:
+                logger.warning(
+                    f"{token} has multiple source embeddings (using first): {[s.native_form for s in overlapping_token_info.source][:min(5, len(embs_lst))]}"
+                )
+        else:
+            overlapping_tokens[token].source_embedding = embs_lst[0]
 
         # Filter some tokens so that they are not used for FOCUS
         if extend_tokenizer and not extend_tokenizer_vocab.get(overlapping_token_info.target.native_form):
@@ -245,25 +268,56 @@ def FOCUS(
     logger.success(f"Copied embeddings for {len(overlapping_tokens)} overlapping tokens.")
 
     ###########################################################
-    # 5. Initialize "bad" new tokens from normal distribution #
+    # 5. Initialize "bad" new tokens based on chosen method    #
     ###########################################################
     emb_mean = source_embeddings.mean(dim=0)
     emb_std = source_embeddings.std(dim=0)
     gen = torch.Generator(device=device).manual_seed(seed)
+    
     for ood_new_token in random_init_new_tokens:
-        target_embeddings[ood_new_token.target.id] = torch.normal(emb_mean, emb_std, generator=gen)
+        if ood_init_method == "random":
+            target_embeddings[ood_new_token.target.id] = torch.normal(emb_mean, emb_std, generator=gen)
+        else:  # average method
+            # Tokenize the OOD token using source tokenizer
+            target_embeddings[ood_new_token.target.id] = average_token_embeddings(source_tokenizer, source_embeddings, ood_new_token.target.native_form)
+            # source_tokens = source_tokenizer.encode(ood_new_token.target.native_form, add_special_tokens=False)
+            # if len(source_tokens) > 0:
+            #     # Average embeddings if we got valid tokens
+            #     source_token_embeddings = source_embeddings[source_tokens]
+            #     target_embeddings[ood_new_token.target.id] = source_token_embeddings.mean(dim=0)
+            # else:
+            #     # Fallback to random init if no valid tokens
+            #     target_embeddings[ood_new_token.target.id] = torch.normal(emb_mean, emb_std, generator=gen)
+            #     logger.debug(f"Falling back to random init for token {ood_new_token.target.native_form} as no source tokens found")
+    
+    init_method_str = "random normal distribution" if ood_init_method == "random" else "source token averaging"
     logger.info(
-        f"Initialized {len(random_init_new_tokens)} new tokens from N(source_mean, source_std) because they do not have auxiliary embeddings (this is okay if it's not too many)."
+        f"Initialized {len(random_init_new_tokens)} new tokens using {init_method_str} (this is okay if it's not too many)."
     )
 
     #######################################################
-    # 6. Finally, initialize additional tokens with FOCUS #
+    # 6. Initialize additional tokens with FOCUS #
     #######################################################
     overlapping_tokens_for_focus = {k: v for k, v in sorted_overlapping_tokens if v.use_for_focus}
     target_embeddings = focus_additional_token_initialization(
         overlapping_tokens_for_focus, new_tokens, target_embeddings, device=device
     )
     logger.success(f"🎯 Initialized {len(new_tokens)} new tokens with FOCUS 🎯")
+    
+    #####################################################################
+    # 7. Finally, initialize special tokens by coping source embeddings #
+    #####################################################################
+    if special_tokens_source_to_target_mapping:
+        for source_token, target_token in special_tokens_source_to_target_mapping.items():
+            source_token_id = source_tokenizer.get_vocab().get(source_token)
+            target_token_id = target_tokenizer.get_vocab().get(target_token)
+            if source_token_id is not None and target_token_id is not None:
+                target_embeddings[target_token_id] = source_embeddings[source_token_id]
+                logger.success(f"Copied source embedding for special token {source_token} to target token {target_token}")
+            else: 
+                assert target_token_id is not None, f"Token {target_token} not found in target tokenizer. Please check your special source to target mapping."
+                target_embeddings[target_token_id] = average_token_embeddings(source_tokenizer, source_embeddings, source_token)
+                logger.success(f"Copied average source embeddings for special token {source_token} to target token {target_token}")
     return target_embeddings.detach()
 
 
