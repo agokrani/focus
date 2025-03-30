@@ -352,7 +352,7 @@ def focus_additional_token_initialization(
 
     # Do `torch.stack` once outside of loop to save time
     overlapping_src_embs = [t.source_embedding for t in overlapping_tokens_lst]
-    overlapping_src_embs = torch.stack(overlapping_src_embs)
+    overlapping_src_embs = torch.stack(overlapping_src_embs).to(device)
 
     for new_token_idx in tqdm(
         range(len(new_tokens_lst)),
@@ -363,6 +363,7 @@ def focus_additional_token_initialization(
 
         # performance optimization
         mask = overlapping_emb_weights > 0.0
+        mask = mask.to(device)  # Add this line
         masked_overlapping_emb_weights = overlapping_emb_weights[mask]
         masked_overlapping_src_embs = overlapping_src_embs[mask]
 
